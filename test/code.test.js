@@ -56,10 +56,10 @@ function thread(id, subject, messages, extra = {}) {
   };
 }
 
-function makeEnv({ threads = [], config = {}, labelExists = true, quota = 100,
+function makeEnv({ threads = [], config = {}, recipients = ['a@example.com', 'b@example.com'], activeUser = MAILBOX, labelExists = true, quota = 100,
   effectiveUser = MAILBOX, aliases = [ALIAS], failFor = [], lockFree = true } = {}) {
   const sent = [];
-  const props = new Map();
+  const props = new Map([['recipients', JSON.stringify(recipients)]]);
   const triggers = [];
   const logs = [];
   const getThreadsCalls = [];
@@ -95,7 +95,10 @@ function makeEnv({ threads = [], config = {}, labelExists = true, quota = 100,
       },
     },
     MailApp: { getRemainingDailyQuota: () => quota },
-    Session: { getEffectiveUser: () => ({ getEmail: () => effectiveUser }) },
+    Session: {
+      getEffectiveUser: () => ({ getEmail: () => effectiveUser }),
+      getActiveUser: () => ({ getEmail: () => activeUser }),
+    },
     LockService: {
       getScriptLock: () => ({ tryLock: () => lockFree, releaseLock: () => {} }),
     },
@@ -238,7 +241,7 @@ test('途中で失敗したら残りは送り、再実行で失敗した人に�
 test('宛先の重複（大文字小文字違い）は1通にまとめる', () => {
   const { context, sent } = makeEnv({
     threads: sampleThreads(),
-    config: { recipients: ['a@example.com', 'A@Example.com'] },
+    recipients: ['a@example.com', 'A@Example.com'],
   });
   context.notifyOverdueThreads();
   assert.deepEqual(sent.map((s) => s.to), ['a@example.com']);
@@ -261,18 +264,42 @@ test('HTMLは件名・送信者をエスケープする', () => {
 });
 
 test('設定が未完了なら送らずに止まる', () => {
-  for (const config of [
-    { recipients: ['REPLACE_WITH_MEMBER_1@example.com'] },
-    { mailboxAddresses: ['REPLACE_WITH_SHARED_MAILBOX@example.com'] },
-    { mailboxAddresses: [] },
+  for (const setup of [
+    { config: { mailboxAddresses: ['REPLACE_WITH_SHARED_MAILBOX@example.com'] } },
+    { config: { mailboxAddresses: [] } },
+    { config: { overdueDays: 0 } },
+    { config: { triggerHour: 24 } },
     { recipients: [] },
-    { overdueDays: 0 },
-    { triggerHour: 24 },
   ]) {
-    const { context, sent } = makeEnv({ threads: sampleThreads(), config });
-    assert.throws(() => context.notifyOverdueThreads(), /./, JSON.stringify(config));
+    const { context, sent } = makeEnv({ threads: sampleThreads(), ...setup });
+    assert.throws(() => context.notifyOverdueThreads(), /./, JSON.stringify(setup));
     assert.equal(sent.length, 0);
   }
+});
+
+test('通知先の画面：まとめて追加・重複と不正な形式は分けて返す・削除', () => {
+  const env = makeEnv({ recipients: ['a@example.com'] });
+  const r = env.context.addRecipients('B@example.com, 山田 <c@example.com>\nbad@\na@example.com；x');
+  assert.deepEqual(plain(r.added), ['b@example.com', 'c@example.com']);
+  assert.deepEqual(plain(r.duplicate), ['a@example.com']);
+  assert.deepEqual(plain(r.invalid), ['bad@']);
+  assert.deepEqual(plain(env.context.listRecipients()), ['a@example.com', 'b@example.com', 'c@example.com']);
+  assert.deepEqual(plain(env.context.removeRecipient('B@Example.com')), ['a@example.com', 'c@example.com']);
+});
+
+test('通知先の画面：上限を超える追加は断る', () => {
+  const env = makeEnv({ recipients: [] });
+  const many = Array.from({ length: 51 }, (_, i) => `m${i}@example.com`).join('\n');
+  assert.throws(() => env.context.addRecipients(many), /50件まで/);
+  assert.deepEqual(plain(env.context.listRecipients()), []);
+});
+
+test('通知先の画面：共有アカウント以外が開いたら断る', () => {
+  const env = makeEnv({ activeUser: 'someone@example.net' });
+  assert.throws(() => env.context.listRecipients(), /共有アカウント/);
+  assert.throws(() => env.context.addRecipients('z@example.com'), /共有アカウント/);
+  const blank = makeEnv({ activeUser: '' });
+  assert.throws(() => blank.context.removeRecipient('a@example.com'), /共有アカウント/);
 });
 
 test('enabled が false なら本番もトリガー作成も断る', () => {

@@ -24,11 +24,8 @@ const CONFIG = Object.freeze({
     'REPLACE_WITH_SHARED_MAILBOX@example.com',
   ],
 
-  // 通知先。各人へ個別に送るので、宛先同士にアドレスは見えない。
-  recipients: [
-    'REPLACE_WITH_MEMBER_1@example.com',
-    'REPLACE_WITH_MEMBER_2@example.com',
-  ],
+  // 通知先はここには書かない。ウェブアプリとして公開した「通知先の設定」画面で追加・削除する
+  // （スクリプト プロパティに保存される。README「通知先を登録する」を参照）。
 
   // テストメールだけを受け取るアドレス。
   testRecipient: 'REPLACE_WITH_YOUR_ADDRESS@example.com',
@@ -50,6 +47,8 @@ const TRIGGER_FUNCTION = 'notifyOverdueThreads';
 const PAGE_SIZE = 100;
 const LOCK_WAIT_MS = 30 * 1000;
 const SENT_LOG_KEY = 'digestSentLog';
+const RECIPIENTS_KEY = 'recipients';
+const MAX_RECIPIENTS = 50;
 
 // ---------------------------------------------------------------------------
 // 利用者が実行する関数
@@ -73,7 +72,7 @@ function notifyOverdueThreads() {
       console.log(`${CONFIG.overdueDays}日以上経過した未対応メールはありません。通知は送りません。`);
       return;
     }
-    const sent = sendDigest_(CONFIG.recipients, result, { isTest: false, now });
+    const sent = sendDigest_(getRecipients_(), result, { isTest: false, now });
     console.log(`${sent}人へ、${result.items.length}件の通知を送信しました。`);
   });
 }
@@ -156,6 +155,194 @@ function removeDailyTrigger() {
   console.log(`通知用トリガーを${triggers.length}本削除しました。`);
   return triggers.length;
 }
+
+// ---------------------------------------------------------------------------
+// 通知先の設定画面（ウェブアプリ）
+// デプロイ時は「次のユーザーとして実行: 自分」「アクセスできるユーザー: 自分のみ」にする。
+// こうすると、共有アカウントでログインしている人しか開けない。
+// ---------------------------------------------------------------------------
+
+function doGet() {
+  return HtmlService.createHtmlOutput(SETTINGS_HTML)
+    .setTitle('通知先の設定｜報道部・未対応メール通知')
+    .addMetaTag('viewport', 'width=device-width, initial-scale=1');
+}
+
+/** 画面から呼ぶ。登録済みの通知先を返す。 */
+function listRecipients() {
+  assertOwner_();
+  return getRecipients_();
+}
+
+/**
+ * 画面から呼ぶ。改行・カンマ・空白・セミコロンで区切った複数のアドレスをまとめて追加する。
+ * 形式が正しくないものは追加せずに返す。
+ */
+function addRecipients(text) {
+  assertOwner_();
+  return withRecipientsLock_(() => {
+    const current = getRecipients_();
+    const added = [];
+    const invalid = [];
+    const duplicate = [];
+    String(text || '').split(/[\s,;、，；]+/).filter((raw) => raw.includes('@')).forEach((raw) => {
+      const address = normalizeAddress_(extractAddress_(raw));
+      if (!isUsableAddress_(address)) invalid.push(raw);
+      else if (current.includes(address) || added.includes(address)) duplicate.push(address);
+      else added.push(address);
+    });
+    if (current.length + added.length > MAX_RECIPIENTS) {
+      throw new Error(`通知先は${MAX_RECIPIENTS}件までです（Gmailの1日の送信上限を守るため）。`);
+    }
+    saveRecipients_(current.concat(added));
+    return { recipients: getRecipients_(), added, invalid, duplicate };
+  });
+}
+
+/** 画面から呼ぶ。通知先を1件削除する。 */
+function removeRecipient(address) {
+  assertOwner_();
+  return withRecipientsLock_(() => {
+    const target = normalizeAddress_(address);
+    saveRecipients_(getRecipients_().filter((item) => item !== target));
+    return getRecipients_();
+  });
+}
+
+function getRecipients_() {
+  try {
+    const saved = JSON.parse(PropertiesService.getScriptProperties().getProperty(RECIPIENTS_KEY) || '[]');
+    return Array.isArray(saved) ? dedupeAddresses_(saved.filter((item) => typeof item === 'string')) : [];
+  } catch (error) {
+    throw new Error('保存された通知先が読めません。「通知先の設定」画面で登録し直してください。');
+  }
+}
+
+function saveRecipients_(recipients) {
+  const list = dedupeAddresses_(recipients).sort();
+  PropertiesService.getScriptProperties().setProperty(RECIPIENTS_KEY, JSON.stringify(list));
+}
+
+function withRecipientsLock_(fn) {
+  const lock = LockService.getScriptLock();
+  if (!lock.tryLock(LOCK_WAIT_MS)) throw new Error('ほかの処理が実行中です。少し待ってからやり直してください。');
+  try {
+    return fn();
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+/**
+ * 画面を開いている人とスクリプトの持ち主が違えば断る。
+ * デプロイを「自分のみ」にしていれば起きないが、設定を誤ったときの保険。
+ */
+function assertOwner_() {
+  let active = '';
+  try {
+    active = normalizeAddress_(Session.getActiveUser().getEmail());
+  } catch (error) {
+    active = '';
+  }
+  const effective = getEffectiveUserEmail_();
+  if (!active || !effective || active !== effective) {
+    throw new Error('この画面は、スクリプトを作った共有アカウントでログインしているときだけ使えます。');
+  }
+}
+
+const SETTINGS_HTML = `<!doctype html>
+<html lang="ja">
+<head>
+<base target="_top">
+<meta charset="utf-8">
+<style>
+  :root { color-scheme: light dark; --line: #8884; --muted: #888; --accent: #1a73e8; --bad: #c5221f; }
+  body { font-family: system-ui, "Hiragino Sans", "Yu Gothic UI", sans-serif; max-width: 640px;
+    margin: 0 auto; padding: 24px 16px; line-height: 1.6; }
+  h1 { font-size: 1.3rem; margin: 0 0 4px; }
+  p.lead { color: var(--muted); margin: 0 0 20px; font-size: .9rem; }
+  textarea { width: 100%; box-sizing: border-box; min-height: 90px; font: inherit; padding: 8px;
+    border: 1px solid var(--line); border-radius: 8px; background: transparent; color: inherit; }
+  button { font: inherit; padding: 6px 14px; border-radius: 8px; border: 1px solid var(--line);
+    background: transparent; color: inherit; cursor: pointer; }
+  button.primary { background: var(--accent); border-color: var(--accent); color: #fff; margin-top: 8px; }
+  button:disabled { opacity: .5; cursor: wait; }
+  ul { list-style: none; padding: 0; margin: 0; border: 1px solid var(--line); border-radius: 8px; }
+  li { display: flex; align-items: center; justify-content: space-between; gap: 8px;
+    padding: 8px 12px; border-top: 1px solid var(--line); overflow-wrap: anywhere; }
+  li:first-child { border-top: 0; }
+  li.empty { color: var(--muted); }
+  h2 { font-size: 1rem; margin: 24px 0 8px; }
+  #msg { min-height: 1.6em; margin-top: 12px; font-size: .9rem; white-space: pre-line; }
+  #msg.bad { color: var(--bad); }
+</style>
+</head>
+<body>
+  <h1>通知先の設定</h1>
+  <p class="lead">「未対応」メールの通知を受け取る部員のアドレスです。各人へ個別に送るので、宛先同士にアドレスは見えません。</p>
+
+  <h2>追加する</h2>
+  <textarea id="input" placeholder="name@example.com&#10;複数ある場合は、改行やカンマで区切ってまとめて貼り付けられます"></textarea>
+  <button class="primary" id="add">追加</button>
+  <div id="msg"></div>
+
+  <h2>登録済み <span id="count"></span></h2>
+  <ul id="list"><li class="empty">読み込み中…</li></ul>
+
+<script>
+  const $ = (id) => document.getElementById(id);
+  function say(text, bad) { $('msg').textContent = text; $('msg').className = bad ? 'bad' : ''; }
+  function busy(on) { document.querySelectorAll('button').forEach((b) => { b.disabled = on; }); }
+  function fail(error) { busy(false); say(error && error.message ? error.message : String(error), true); }
+
+  function render(list) {
+    busy(false);
+    $('count').textContent = '（' + list.length + '件）';
+    const ul = $('list');
+    ul.textContent = '';
+    if (list.length === 0) {
+      const li = document.createElement('li');
+      li.className = 'empty';
+      li.textContent = 'まだ登録されていません。登録がないあいだ、通知は送られません。';
+      ul.appendChild(li);
+      return;
+    }
+    list.forEach((address) => {
+      const li = document.createElement('li');
+      const span = document.createElement('span');
+      span.textContent = address;
+      const del = document.createElement('button');
+      del.textContent = '削除';
+      del.onclick = () => {
+        if (!confirm(address + ' を通知先から外しますか？')) return;
+        busy(true);
+        google.script.run.withSuccessHandler((next) => { render(next); say(address + ' を外しました。'); })
+          .withFailureHandler(fail).removeRecipient(address);
+      };
+      li.append(span, del);
+      ul.appendChild(li);
+    });
+  }
+
+  $('add').onclick = () => {
+    const text = $('input').value;
+    if (!text.trim()) { say('アドレスを入力してください。', true); return; }
+    busy(true);
+    google.script.run.withSuccessHandler((result) => {
+      render(result.recipients);
+      const lines = [];
+      if (result.added.length) lines.push(result.added.length + '件追加しました。');
+      if (result.duplicate.length) lines.push('登録済みのため省略: ' + result.duplicate.join(', '));
+      if (result.invalid.length) lines.push('形式が正しくないため追加していません: ' + result.invalid.join(', '));
+      say(lines.join('\\n') || '追加するものがありませんでした。', result.invalid.length > 0);
+      $('input').value = result.invalid.join('\\n');
+    }).withFailureHandler(fail).addRecipients(text);
+  };
+
+  google.script.run.withSuccessHandler(render).withFailureHandler(fail).listRecipients();
+</script>
+</body>
+</html>`;
 
 // ---------------------------------------------------------------------------
 // 抽出
@@ -396,11 +583,12 @@ function validateConfig_(options) {
   });
 
   if (options.requireRecipients) {
-    if (!Array.isArray(CONFIG.recipients) || CONFIG.recipients.length === 0) {
-      throw new Error('recipients を1件以上設定してください。');
+    const recipients = getRecipients_();
+    if (recipients.length === 0) {
+      throw new Error('通知先が1件も登録されていません。「通知先の設定」画面で追加してください。');
     }
-    CONFIG.recipients.forEach((address, index) => {
-      validateAddress_(address, `recipients[${index}]`);
+    recipients.forEach((address, index) => {
+      validateAddress_(address, `通知先[${index}]`);
     });
   }
 }
