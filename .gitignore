@@ -1,0 +1,6 @@
+# 実アドレスを入れた控えを置かないための名前
+*.local.gs
+*.local.js
+.clasp.json
+.clasprc.json
+node_modules/
